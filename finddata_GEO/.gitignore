@@ -1,0 +1,4 @@
+# finddata_GEO 本地缓存（不提交）
+cache/
+__pycache__/
+*.pyc
