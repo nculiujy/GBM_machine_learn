@@ -169,6 +169,16 @@ def parse_args():
             "RNA-seq 定量通常建议 false（仅标记），但默认保持 true 以兼容现有结果。"
         )
     )
+    parser.add_argument(
+        "--max_parallel_anno",
+        type=int, default=8,
+        help="8 类注释并行 worker 数（默认 8）"
+    )
+    parser.add_argument(
+        "--anno_threads",
+        type=int, default=2,
+        help="每个 stringtie 的线程数（默认 2，stringtie 多线程效率低）"
+    )
     return parser.parse_args()
 
 
@@ -333,7 +343,15 @@ def run_hisat2(srr, qc_dir, align_dir, species, threads, strandedness="unstrande
 # ─────────────────────────────────────────────
 # Step 4: StringTie 定量
 # ─────────────────────────────────────────────
-def run_stringtie(srr, align_dir, species, threads, strandedness="unstranded"):
+def run_stringtie(srr, align_dir, species, threads, strandedness="unstranded",
+                  max_parallel_anno=8, anno_threads=2):
+    """8 类注释并行定量。
+    设计要点:
+      - stringtie 多线程效率差（-p 10 实测仅 ~1.3 核），每类用 -p 2 即可
+      - 8 类并行 × 2 线程 = 16 线程/样本，比原 8×threads 预算更省、速度更快
+      - 每类输出目录独立（anno['dir']），天然线程安全
+      - 单类失败不影响其他类（容错），失败类记录到日志
+    """
     annotations = ANNOTATIONS.get(species, [])
     if not annotations:
         ts_log(f"[Quant-Error] {srr}: 未知物种 {species}")
@@ -342,37 +360,58 @@ def run_stringtie(srr, align_dir, species, threads, strandedness="unstranded"):
     hisat2_dir = os.path.join(align_dir, "hisat2file", srr)
     dedup_bam  = os.path.join(hisat2_dir, f"{srr}.dedup.bam")
 
+    # ★ 校验 BAM 存在性（防止比对失败后连环报错 8 次）
     if not os.path.exists(dedup_bam):
-        ts_log(f"[Quant-Error] {srr}: dedup BAM 不存在，跳过定量")
+        ts_log(f"[Quant-Skip] {srr}: dedup BAM 不存在（比对可能失败或磁盘满），标记样本失败")
+        return False
+    # 校验 BAM 大小（避免 0 字节空文件）
+    if os.path.getsize(dedup_bam) < 1000:
+        ts_log(f"[Quant-Skip] {srr}: dedup BAM 文件异常小 ({os.path.getsize(dedup_bam)} bytes)，可能损坏")
         return False
 
     # StringTie 链特异性标志：unstranded 不加，forward→--fr，reverse→--rf
     _strand_flag = {"forward": ["--fr"], "reverse": ["--rf"]}.get(strandedness, [])
 
-    ts_log(f"[Quant] {srr}: 开始 StringTie 定量 (strandedness={strandedness}) ...")
+    ts_log(f"[Quant] {srr}: 开始 StringTie 定量 (strandedness={strandedness}, "
+           f"{len(annotations)} 类并行×{anno_threads}线程) ...")
     t0_quant = datetime.now()
-    for anno in annotations:
+
+    def _run_one(anno):
+        """定量单个注释类（每个 worker 独立执行）"""
         out_dir   = os.path.join(align_dir, anno["dir"], srr)
         os.makedirs(out_dir, exist_ok=True)
         out_gtf   = os.path.join(out_dir, "transcripts.gtf")
         gene_abund = os.path.join(out_dir, "gene_abund.tab")
-
         if os.path.exists(out_gtf):
-            continue
-
+            return True, anno["dir"], "skip(已存在)"
         cmd = (
-            ["stringtie", "-p", str(threads), "-e", "-B"]
+            ["stringtie", "-p", str(anno_threads), "-e", "-B"]
             + _strand_flag
             + ["-G", anno["gff"], "-A", gene_abund, "-o", out_gtf, dedup_bam]
         )
         try:
             subprocess.run(cmd, check=True)
+            return True, anno["dir"], "ok"
         except subprocess.CalledProcessError as e:
-            ts_log(f"[Quant-Error] {srr} ({anno['dir']}): {e}")
+            return False, anno["dir"], str(e)
 
+    # ★ 并行执行 8 类（复用文件顶部已 import 的 ThreadPoolExecutor）
+    n_workers = min(max_parallel_anno, len(annotations))
+    failed = []
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(_run_one, anno) for anno in annotations]
+        for fut in futures:
+            ok, dirname, msg = fut.result()
+            if not ok:
+                failed.append(f"{dirname}: {msg[:80]}")
+
+    if failed:
+        for f in failed:
+            ts_log(f"[Quant-Error] {srr} ({f})")
     elapsed = (datetime.now() - t0_quant).total_seconds()
-    ts_log(f"[Quant-Done] {srr}: {elapsed:.1f}s")
-    return True
+    ts_log(f"[Quant-Done] {srr}: {elapsed:.1f}s"
+           + (f"（{len(failed)} 类失败: {failed}）" if failed else ""))
+    return len(failed) == 0
 
 
 # ─────────────────────────────────────────────
@@ -432,9 +471,11 @@ def process_sample(srr, args):
         ts_log(f"[Pipeline-Error] {srr}: 比对失败")
         return False
 
-    # 4. StringTie 定量（传入链特异性设置）
+    # 4. StringTie 定量（传入链特异性设置 + 8 类并行参数）
     if not run_stringtie(srr, args.align_dir, args.species,
-                         args.threads, getattr(args, "strandedness", "unstranded")):
+                         args.threads, getattr(args, "strandedness", "unstranded"),
+                         getattr(args, "max_parallel_anno", 8),
+                         getattr(args, "anno_threads", 2)):
         ts_log(f"[Pipeline-Error] {srr}: 定量失败")
         return False
 
@@ -477,8 +518,25 @@ def cleanup_chunk(success_srrs, args, keep_bam=False, keep_sra=False):
         if not keep_bam:
             bam_dir = os.path.join(args.align_dir, "hisat2file", srr)
             if os.path.exists(bam_dir):
+                # ★ 先保留 QC_results.log（比对率信息），供 03_filter_alignment 使用
+                qc_log = os.path.join(bam_dir, "QC_results.log")
+                if os.path.exists(qc_log):
+                    qc_logs_dir = os.path.join(args.align_dir, "QC_logs")
+                    os.makedirs(qc_logs_dir, exist_ok=True)
+                    shutil.copy2(qc_log, os.path.join(qc_logs_dir, f"{srr}.log"))
+                    ts_log(f"[ChunkClean] {srr}: 已保留 QC_results.log 到 QC_logs/")
                 shutil.rmtree(bam_dir, ignore_errors=True)
                 ts_log(f"[ChunkClean] {srr}: 已删除 bam 目录")
+
+
+def _check_disk_space(min_free_gb=50):
+    """
+    检查当前目录所在分区剩余空间。
+    返回 (free_gb, ok) 其中 ok 表示是否大于阈值。
+    """
+    usage = shutil.disk_usage(".")
+    free_gb = usage.free / 1e9
+    return free_gb, free_gb >= min_free_gb
 
 
 def _run_chunk(chunk_srrs, args):
@@ -553,8 +611,28 @@ def main():
         ts_log(f"[Info] 滚动窗口模式: chunk_size={chunk_size}，"
                f"共 {len(chunks)} 批，每批最多 {chunk_size} 个样本")
 
+        # 磁盘安全阈值（GB）：低于此值暂停，等待清理
+        _min_disk_gb = float(os.environ.get("MIN_FREE_GB", "50"))
+
         for idx, chunk in enumerate(chunks, 1):
-            ts_log(f"[Chunk {idx}/{len(chunks)}] 开始处理: {chunk}")
+            # ★ 每个 chunk 前检查磁盘空间
+            _free_gb, _disk_ok = _check_disk_space(_min_disk_gb)
+            if not _disk_ok:
+                ts_log(f"[DiskWarn] 磁盘剩余 {_free_gb:.1f} GB < 阈值 {_min_disk_gb} GB！")
+                ts_log(f"[DiskWarn] 暂停处理，等待 5 分钟后重试...（已完成 {idx-1}/{len(chunks)} 批）")
+                import time as _time
+                _time.sleep(300)
+                # 再检查一次
+                _free_gb, _disk_ok = _check_disk_space(_min_disk_gb)
+                if not _disk_ok:
+                    ts_log(f"[DiskError] 磁盘仍不足 ({_free_gb:.1f} GB)，停止后续 chunk 避免写满磁盘")
+                    ts_log(f"[DiskError] 已处理的样本结果已保留，请释放磁盘后重跑")
+                    # 将剩余未处理的样本标记为失败
+                    for remaining_chunk in chunks[idx-1:]:
+                        all_failed.extend(remaining_chunk)
+                    break
+
+            ts_log(f"[Chunk {idx}/{len(chunks)}] 开始处理: {chunk} (磁盘剩余 {_free_gb:.1f} GB)")
             failed = _run_chunk(chunk, args)
 
             # 只清理成功的样本，失败的保留 .sra 以供 --rerun-incomplete 重试
@@ -577,18 +655,34 @@ def main():
     os.makedirs(marker_dir, exist_ok=True)
     failed_report = os.path.join(marker_dir, "failed_samples.txt")
 
-    if all_failed:
-        ts_log(f"[Error] 数据集 {args.dataset_id} 以下样本处理失败: {all_failed}")
+    n_success = len(srr_list) - len(all_failed)
+
+    if all_failed and n_success == 0:
+        # 全部失败：不写 marker，Snakemake 视为该任务失败
+        ts_log(f"[Error] 数据集 {args.dataset_id} 所有 {len(all_failed)} 个样本均失败！")
         ts_log(f"[Error] 流程终止，请检查日志后重新运行（--rerun-incomplete）。")
-        # 写出失败样本列表，方便 UI 展示和用户排查
         with open(failed_report, "w") as f:
-            f.write(f"# {args.dataset_id} failed samples ({len(all_failed)}/{len(srr_list)})\n")
+            f.write(f"# {args.dataset_id} ALL samples failed ({len(all_failed)}/{len(srr_list)})\n")
             f.write(f"# Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             for srr in all_failed:
                 f.write(f"{srr}\n")
         ts_log(f"[Info] 失败样本列表已写出: {failed_report}")
-        # 不写 marker，以非零退出码通知 Snakemake 此任务失败
         sys.exit(1)
+    elif all_failed:
+        # 部分失败：写出 marker（让 03/04 可以继续处理成功的样本），但记录失败
+        ts_log(f"[Warn] 数据集 {args.dataset_id}: {n_success}/{len(srr_list)} 个样本成功，"
+               f"{len(all_failed)} 个失败: {all_failed}")
+        with open(failed_report, "w") as f:
+            f.write(f"# {args.dataset_id} partial failure ({len(all_failed)}/{len(srr_list)} failed)\n")
+            f.write(f"# Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            for srr in all_failed:
+                f.write(f"{srr}\n")
+        ts_log(f"[Info] 失败样本列表已写出: {failed_report}")
+        # 写出 marker（partial 状态），让后续 03/04 规则可以继续
+        with open(args.output_marker, "w") as f:
+            f.write(f"partial: {n_success}/{len(srr_list)} samples succeeded, "
+                    f"{len(all_failed)} failed\n")
+        ts_log(f"[Info] 标志文件已写出（partial）: {args.output_marker}")
     else:
         ts_log(f"[Done] 数据集 {args.dataset_id} 所有样本处理完成")
         with open(args.output_marker, "w") as f:

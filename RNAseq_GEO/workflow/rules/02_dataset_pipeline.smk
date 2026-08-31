@@ -68,8 +68,10 @@ rule dataset_pipeline:
         anno_base         = config.get("anno_base", ""),
         hisat2_index      = lambda wildcards: config.get("hisat2_index", {}).get(wildcards.species, ""),
         remove_duplicates = "true" if config.get("remove_duplicates", True) else "false",
+        max_parallel_anno = config.get("max_parallel_anno", 8),   # 8 类注释并行度（可配）
+        anno_threads      = config.get("anno_threads", 2),        # 每类 stringtie 线程数（实测 -p 2 足够）
     log:
-        "logs/{project}_{species}_{gse}_02_dataset_pipeline.log"
+        "logs/{project}/{species}_{gse}_02_dataset_pipeline.log"
     threads: config.get("pipeline_threads", 8) * config.get("pipeline_parallel", 4)
     resources:
         gse_slots = 1    # ★ 串行化：同一时刻只处理一个 GSE
@@ -96,6 +98,8 @@ rule dataset_pipeline:
             --anno_base          "{params.anno_base}" \
             --hisat2_index       "{params.hisat2_index}" \
             --remove_duplicates  {params.remove_duplicates} \
+            --max_parallel_anno  {params.max_parallel_anno} \
+            --anno_threads       {params.anno_threads} \
             --output_marker      {output.marker} > {log} 2>&1
 
         # ★ 即跑即删（shell 层兜底清理）：
@@ -110,7 +114,8 @@ rule dataset_pipeline:
 
         # 可选：删除 bam（保留表达矩阵输入，节省磁盘）
         if [ "{params.keep_bam}" != "True" ]; then
-            echo "[Cleanup] 删除残余 bam 文件..." >> {log}
-            rm -rf {params.align_dir}/hisat2file
+            echo "[Cleanup] 删除 bam/sam，保留 QC_results.log ..." >> {log}
+            find {params.align_dir}/hisat2file -type f \( -name "*.bam" -o -name "*.sam" \) -delete 2>/dev/null
+            # 保留 hisat2file 目录结构（含 QC_results.log），供 03_filter_alignment 扫描
         fi
         """

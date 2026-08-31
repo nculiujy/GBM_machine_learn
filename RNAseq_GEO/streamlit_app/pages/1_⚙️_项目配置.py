@@ -434,6 +434,18 @@ with tab4:
     lcfg = load_llm_cfg()
     llm = lcfg.get("llm", {})
 
+    # ★ LLM 总开关
+    llm_enabled = st.toggle(
+        "🔌 启用 LLM 功能",
+        value=bool(llm.get("enabled", False)),
+        help="关闭后所有 AI 解读功能停用，不产生任何 API 费用",
+        key="llm_enabled_toggle"
+    )
+    if not llm_enabled:
+        st.warning("⚠️ LLM 已关闭，AI 解读功能不可用，不会消耗 API 费用")
+
+    st.divider()
+
     col1, col2 = st.columns(2)
     with col1:
         api_base = st.text_input(
@@ -467,6 +479,7 @@ with tab4:
     if st.button("💾 保存 LLM 配置", type="primary", key="save_llm"):
         fresh_llm = load_llm_cfg()
         fresh_llm["llm"] = {
+            "enabled":          llm_enabled,
             "provider":         "openai-compatible",
             "api_base":         api_base,
             "model":            model,

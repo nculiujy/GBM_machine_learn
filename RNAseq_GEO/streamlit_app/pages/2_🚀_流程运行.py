@@ -169,14 +169,18 @@ with tab_srr:
             d for d in _glob.glob(os.path.join(sra_info_dir, "GSE*"))
             if os.path.isdir(d) and os.path.exists(os.path.join(d, "SraRunInfo.csv"))
         ])
-        fetched_gses = [os.path.basename(d) for d in existing_gse_dirs]
+        _all_fetched = [os.path.basename(d) for d in existing_gse_dirs]
+        # 只统计在当前 GSE 号列表中的（移除的 GSE 不计入）
+        fetched_gses = [g for g in _all_fetched if g in current_gses] if current_gses else _all_fetched
 
-        if fetched_gses:
-            # 对比哪些已获取，哪些待获取
+        if current_gses:
+            # 对比哪些已获取，哪些待获取（以 current_gses 为准）
             pending_fetch = [g for g in current_gses if g not in fetched_gses]
-            st.success(f"✅ 已有 {len(fetched_gses)} 个 GSE 的 SRA 信息")
+            st.success(f"✅ 已获取 {len(fetched_gses)}/{len(current_gses)} 个 GSE 的 SRA 信息")
             if pending_fetch:
                 st.warning(f"⏳ 待获取: {len(pending_fetch)} 个 ({', '.join(pending_fetch[:5])}{'...' if len(pending_fetch)>5 else ''})")
+        elif _all_fetched:
+            st.success(f"✅ 已有 {len(_all_fetched)} 个 GSE 的 SRA 信息（GSE 列表为空）")
         else:
             st.info("尚无 SRA 信息文件，请先保存 GSE 列表并运行爬取")
 
@@ -237,6 +241,23 @@ with tab_intel:
         "**流程**：① 预拉取 GEO 信息（无需 LLM API）→ ② 输入研究背景 → ③ AI 生成解读卡"
     )
 
+    # ★ 读取 LLM 总开关
+    _llm_enabled = False
+    try:
+        import yaml as _yaml_llm
+        _llm_cfg_path = os.path.join(ROOT, "config", "llm.yaml")
+        if os.path.exists(_llm_cfg_path):
+            with open(_llm_cfg_path) as _f:
+                _llm_enabled = bool(_yaml_llm.safe_load(_f).get("llm", {}).get("enabled", False))
+    except Exception:
+        _llm_enabled = False
+
+    if not _llm_enabled:
+        st.warning(
+            "⚠️ **LLM 功能已关闭**，AI 解读按钮不可用，不会消耗 API 费用。\n\n"
+            "如需启用，请前往「⚙️ 项目配置 → LLM 设置」打开「启用 LLM 功能」开关并保存。"
+        )
+
     from streamlit_app.core import geo as st_geo
 
     @st.cache_data(ttl=120)
@@ -244,7 +265,9 @@ with tab_intel:
         return st_geo.load_all_sra_info(sra_dir)
 
     sra_rows_intel = get_sra_rows_intel(sra_info_dir)
-    gse_list_intel = sorted(set(r.get("GSE", "") for r in sra_rows_intel if r.get("GSE")))
+    # 只展示当前 SRR_table.txt 中的 GSE（移除的 GSE 不再展示解读卡）
+    _all_fetched_gses = sorted(set(r.get("GSE", "") for r in sra_rows_intel if r.get("GSE")))
+    gse_list_intel = [g for g in _all_fetched_gses if g in current_gses] if current_gses else _all_fetched_gses
 
     if not gse_list_intel:
         st.info("请先在「① 获取 SRR 列表」Tab 中完成 SRR 信息爬取，才能进行 GSE 解读。")
@@ -303,7 +326,7 @@ with tab_intel:
             key="global_question"
         )
 
-        if st.button("🤖 向 AI 提问（整体分析）", key="global_qa_btn"):
+        if st.button("🤖 向 AI 提问（整体分析）", key="global_qa_btn", disabled=not _llm_enabled):
             # 构建整体上下文：汇总所有已有解读卡的关键信息
             intel_dir = os.path.join("result", project, "00_data_intel")
             summary_parts = [f"研究背景: {user_hint.strip()}" if user_hint else ""]
@@ -520,7 +543,8 @@ with tab_cap:
             "--sra_info",   sra_info_dir,
             "--config",     "config/config.yaml",
             "--project",    project,
-            "--output_dir", f"result/{project}/00_planning"
+            "--output_dir", f"result/{project}/00_planning",
+            "--gse_list",   srr_table_path,  # 只规划当前 GSE 列表中的 GSE
         ]
         with st.spinner("运行容量规划..."):
             r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
@@ -578,12 +602,13 @@ with tab_cap:
             import csv as _csv_s
             import glob as _glob_sel
 
-            # 获取所有有 SraRunInfo.csv 的 GSE 列表
-            _gse_dirs_all = sorted([
+            # 获取所有有 SraRunInfo.csv 的 GSE 列表（只展示当前 SRR_table.txt 中的 GSE）
+            _gse_dirs_all_raw = sorted([
                 os.path.basename(d)
                 for d in _glob_sel.glob(os.path.join(sra_info_dir, "GSE*"))
                 if os.path.isdir(d) and os.path.exists(os.path.join(d, "SraRunInfo.csv"))
             ])
+            _gse_dirs_all = [g for g in _gse_dirs_all_raw if g in current_gses] if current_gses else _gse_dirs_all_raw
 
             if not _gse_dirs_all:
                 st.info("未找到 SraRunInfo.csv，请先完成「获取 SRR 列表」步骤。")
@@ -871,7 +896,7 @@ with tab_cap:
 
 # ─────────── Tab ④: 启动 & 监控 ───────────
 with tab_run:
-    st.subheader("④ 启动 & 监控 Snakemake 批处理")
+    st.subheader(" 启动 & 监控 Snakemake 批处理")
     st.caption(
         "通过 `run_all.sh` 后台启动 snakemake（`gse_slots=1` 串行，一批一批跑）。\n"
         "UI 关闭后任务继续运行；重新打开 UI 点「启动/续跑」即自动续跑。"

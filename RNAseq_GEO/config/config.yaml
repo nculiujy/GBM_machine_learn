@@ -20,13 +20,15 @@ aria2c_connections: 16
 aria2c_split: 16
 aria2c_chunk: 1M
 aria2c_timeout: 300
-pipeline_threads: 12
-pipeline_parallel: 12
-sample_chunk_size: 24
+pipeline_threads: 10
+pipeline_parallel: 6
+sample_chunk_size: 14
+max_parallel_anno: 8
+anno_threads: 2
 filter_threads: 1
 merge_threads: 1
 alignment_rate_cutoff: 70.0
-remove_duplicates: true    # Picard MarkDuplicates: true=删除dup reads, false=仅标记
+remove_duplicates: true
 batch:
   gse_slots: 1
   jobs: 32
@@ -35,7 +37,7 @@ cleanup:
   keep_sra: false
   keep_bam: false
 planning:
-  safety_disk_ratio: 0.8
+  safety_disk_ratio: 1.0
   io_overhead: 0.15
   alpha_per_m_spots: 0.12
   beta_fixed_min: 8.0

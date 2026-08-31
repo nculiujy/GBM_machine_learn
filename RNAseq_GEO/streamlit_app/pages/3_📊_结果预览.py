@@ -186,7 +186,11 @@ with tab_qc:
             # 每 GSE 通过率
             if "Sample_ID" in df_qc.columns and "Passed" in df_qc.columns:
                 try:
-                    df_qc["GSE"] = df_qc["Sample_ID"].str.extract(r"(GSE\d+)", expand=False)
+                    # ★ 修复：Sample_ID 为 SRR 号不含 GSE，需从 Path 列提取 GSE
+                    if "Path" in df_qc.columns:
+                        df_qc["GSE"] = df_qc["Path"].str.extract(r"(GSE\d+)", expand=False)
+                    else:
+                        df_qc["GSE"] = df_qc["Sample_ID"].str.extract(r"(GSE\d+)", expand=False)
                     gse_rate = (
                         df_qc.groupby("GSE")["Passed"]
                         .apply(lambda x: (x == "Yes").mean() * 100)

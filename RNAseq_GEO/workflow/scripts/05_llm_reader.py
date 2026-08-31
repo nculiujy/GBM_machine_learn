@@ -395,6 +395,13 @@ def main():
     # 加载配置
     load_env(args.env_file)
     llm_cfg = load_llm_config(args.llm_config)
+
+    # ★ 检查 LLM 总开关
+    if not llm_cfg.get("enabled", True):
+        print("[SKIP] LLM 功能已关闭（config/llm.yaml: enabled: false），跳过 AI 解读。")
+        print("[SKIP] 如需启用，请将 llm.enabled 设为 true 并保存配置。")
+        sys.exit(0)
+
     api_key = os.environ.get("LLM_API_KEY", "")
     if not api_key:
         print("[ERROR] 未找到 LLM_API_KEY，请在 config/.env 中设置")

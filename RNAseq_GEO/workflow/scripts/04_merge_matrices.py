@@ -59,6 +59,12 @@ def load_qc_pass_samples(qc_csv):
         df = pd.read_csv(qc_csv)
         passed_samples = set(df[df['Passed'] == 'Yes']['Sample_ID'])
         print(f"Loaded {len(passed_samples)} passing samples from QC file.")
+        # ★ 空 QC 文件（0 条通过记录）视为"不过滤"，保留全部样本，
+        #   避免因 QC 日志缺失导致矩阵被全部过滤掉
+        if len(passed_samples) == 0:
+            print("Warning: QC file contains 0 passing samples. "
+                  "Treating as 'no filtering' and keeping all samples.")
+            return None
         return passed_samples
     except Exception as e:
         print(f"Error reading QC file: {e}")
@@ -155,6 +161,11 @@ def main():
     print(f"Output directory updated with timestamp: {final_outputdir}")
     
     passed_samples = load_qc_pass_samples(args.filter_csv)
+    # ★ 修复：QC 表存在但为空/0 passing 时，回退为不过滤（警告）
+    if args.filter_csv and passed_samples is not None and len(passed_samples) == 0:
+        print("WARNING: QC 文件存在但 0 个 passing 样本（可能是 03 扫描异常），"
+              "回退为不过滤，合并全部样本")
+        passed_samples = None
     
     merge_expression_matrices(args.inputdir, final_outputdir, args.gtf_base, passed_samples)
     

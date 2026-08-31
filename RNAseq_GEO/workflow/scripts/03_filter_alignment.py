@@ -15,31 +15,47 @@ def parse_args():
 def extract_alignment_rates(inputdir, outputdir, cutoff=70.0):
     print(f"Extracting alignment rates (cutoff={cutoff}%)...")
     results = []
-    
-    # 递归查找所有 QC_results.log
+    seen_samples = set()
+
+    def _add_result(sample_id, log_file):
+        """解析单个 QC 日志并加入结果（去重）"""
+        if sample_id in seen_samples:
+            return
+        try:
+            with open(log_file, "r") as f:
+                content = f.read()
+                matches = re.findall(r"(\d+\.\d+)%", content)
+                if matches:
+                    rate = float(matches[-1])
+                    passed = "Yes" if rate >= cutoff else "No"
+                    results.append({
+                        "Sample_ID": sample_id,
+                        "Alignment_Rate": rate,
+                        "Passed": passed,
+                        "Path": log_file
+                    })
+                    seen_samples.add(sample_id)
+        except Exception as e:
+            print(f"Failed to read log {log_file}: {e}")
+
+    # 1) 递归查找所有 QC_results.log（hisat2file 目录，若尚未被清理）
     for root, dirs, files in os.walk(inputdir):
         if "QC_results.log" in files:
             log_file = os.path.join(root, "QC_results.log")
-            # 假设路径结构 .../GSExxx/hisat2file/SampleID/QC_results.log
-            # 向上两级是 GSE 目录，父目录是 SampleID
+            # 路径结构 .../GSExxx/hisat2file/SampleID/QC_results.log
             sample_id = os.path.basename(root)
-            
-            try:
-                with open(log_file, "r") as f:
-                    content = f.read()
-                    matches = re.findall(r"(\d+\.\d+)%", content)
-                    if matches:
-                        rate = float(matches[-1])
-                        passed = "Yes" if rate >= cutoff else "No"
-                        results.append({
-                            "Sample_ID": sample_id,
-                            "Alignment_Rate": rate,
-                            "Passed": passed,
-                            "Path": log_file
-                        })
-            except Exception as e:
-                print(f"Failed to read log {log_file}: {e}")
-    
+            _add_result(sample_id, log_file)
+
+    # 2) 递归查找所有 QC_logs/ 目录（chunk 清理时保留的比对率日志，文件名为 SampleID.log）
+    #    ★ 修复：QC_logs 可能位于 inputdir/QC_logs（旧结构）或
+    #      每个 GSE 子目录下 inputdir/GSExxx/QC_logs（当前结构），需递归扫描
+    for root, dirs, files in os.walk(inputdir):
+        if os.path.basename(root) == "QC_logs":
+            for fname in sorted(files):
+                if fname.endswith(".log"):
+                    sample_id = os.path.splitext(fname)[0]
+                    _add_result(sample_id, os.path.join(root, fname))
+
     csv_file = os.path.join(outputdir, "alignment_quality.csv")
     with open(csv_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["Sample_ID", "Alignment_Rate", "Passed", "Path"])
